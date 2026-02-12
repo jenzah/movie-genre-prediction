@@ -34,3 +34,4 @@ def load_all_csv_files(data_folder: str = "./data"):
             print(f"Error loading {file_path.name}: {e}")
     
     return dataframes
+
