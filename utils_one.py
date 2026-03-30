@@ -602,8 +602,7 @@ class FeatureEngineer:
         'crime':    ['murder', 'detective', 'police', 'crime', 'criminal', 'investigation', 'gang'],
     }
 
-    # Placeholder for missing genre slots (genre_2, genre_3 when a movie has fewer genres)
-    NONE_LABEL = 'none'
+
 
     # Columns to one-hot encode directly (low cardinality categoricals)
     LOW_CARDINALITY_COLS = ['status', 'original_language', 'movie_rated']
@@ -639,12 +638,8 @@ class FeatureEngineer:
         self._ohe_categories: Dict[str, List[str]] = {}
         self._feature_columns: Optional[List[str]] = None
 
-        # One LabelEncoder per genre slot — fitted on training labels only
-        self._label_encoders: Dict[str, LabelEncoder] = {
-            'genre_1': LabelEncoder(),
-            'genre_2': LabelEncoder(),
-            'genre_3': LabelEncoder(),
-        }
+        # Single LabelEncoder for the primary genre (genre_1)
+        self._label_encoder = LabelEncoder()
 
         self._fitted = False
 
@@ -656,75 +651,48 @@ class FeatureEngineer:
     # TARGET: genres → genre_1 / genre_2 / genre_3
     # ------------------------------------------------------------------
 
-    def _split_genres(self, genres_series: pd.Series) -> pd.DataFrame:
+    def _extract_primary_genre(self, genres_series: pd.Series) -> pd.Series:
         """
-        Takes the raw genres string column and produces three columns:
-          genre_1 — primary genre (always filled)
-          genre_2 — secondary genre, or NONE_LABEL if absent
-          genre_3 — tertiary genre, or NONE_LABEL if absent
+        Extracts the first (primary) genre from the genres string.
+        This is the only target used for prediction.
 
-        Strategy: take the first 3 genres in the original order (preserving
-        the primary genre signal), then fill missing slots with NONE_LABEL.
-        We deliberately do NOT sort here because order is meaningful
-        (the first genre is the principal genre for that movie).
+        Example: "drama, comedy, romance" → "drama"
         """
-        def parse_top3(val):
+        def parse_primary(val):
             if pd.isna(val) or str(val).strip().lower() in ('nan', '', 'unset'):
-                return [self.NONE_LABEL, self.NONE_LABEL, self.NONE_LABEL]
+                return 'unknown'
             genres = [g.strip() for g in str(val).split(',') if g.strip()]
-            # Keep only the first 3 — ignore anything beyond position 3
-            top3 = genres[:3]
-            # Pad with NONE_LABEL to always have exactly 3 slots
-            while len(top3) < 3:
-                top3.append(self.NONE_LABEL)
-            return top3
+            return genres[0] if genres else 'unknown'
 
-        parsed = genres_series.apply(parse_top3)
-        return pd.DataFrame(
-            parsed.tolist(),
-            columns=['genre_1', 'genre_2', 'genre_3'],
-            index=genres_series.index
-        )
+        return genres_series.apply(parse_primary)
 
     def fit_target(self, genres_series: pd.Series):
         """
-        Fits one LabelEncoder per genre slot on training data.
-        NONE_LABEL is explicitly added to every slot's vocabulary so that
-        transform() never crashes when genre_2 or genre_3 is absent in a row,
-        even if the training split happened to contain no such rows.
+        Fits the LabelEncoder on the primary genre (genre_1) from training data.
+        Only the first genre in the string is used as the target.
         """
-        split = self._split_genres(genres_series)
-        for slot, le in self._label_encoders.items():
-            # Concatenate a sentinel Series containing NONE_LABEL before fitting,
-            # guaranteeing it is always a known class regardless of the split.
-            values = pd.concat([
-                split[slot],
-                pd.Series([self.NONE_LABEL])
-            ], ignore_index=True)
-            le.fit(values)
-            self._vprint(f"  '{slot}': {len(le.classes_)} classes — {list(le.classes_)}")
+        primary = self._extract_primary_genre(genres_series)
+        self._label_encoder.fit(primary)
+        self._vprint(f"  genre_1: {len(self._label_encoder.classes_)} classes — {list(self._label_encoder.classes_)}")
 
-    def transform_target(self, genres_series: pd.Series) -> pd.DataFrame:
+    def transform_target(self, genres_series: pd.Series) -> pd.Series:
         """
-        Transforms genres into a 3-column integer DataFrame (genre_1, genre_2, genre_3).
-        Unseen labels at test time are mapped to NONE_LABEL (safe fallback).
+        Transforms the genres column into a single integer Series (primary genre only).
+        Unseen labels at test time are mapped to the most frequent training genre.
         """
-        split = self._split_genres(genres_series)
-        result = pd.DataFrame(index=genres_series.index)
+        primary = self._extract_primary_genre(genres_series)
+        known = set(self._label_encoder.classes_)
+        fallback = self._label_encoder.classes_[0]  # alphabetically first — safe default
+        safe = primary.apply(lambda x: x if x in known else fallback)
+        return pd.Series(
+            self._label_encoder.transform(safe),
+            index=genres_series.index,
+            name='genre_1'
+        )
 
-        for slot, le in self._label_encoders.items():
-            known_classes = set(le.classes_)
-            # Map unseen labels to NONE_LABEL so transform never crashes
-            safe = split[slot].apply(
-                lambda x: x if x in known_classes else self.NONE_LABEL
-            )
-            result[slot] = le.transform(safe)
-
-        return result
-
-    def get_genre_classes(self) -> Dict[str, np.ndarray]:
-        """Returns the class arrays for each genre slot (useful for reporting)."""
-        return {slot: le.classes_ for slot, le in self._label_encoders.items()}
+    def get_genre_classes(self) -> np.ndarray:
+        """Returns the genre class array (useful for reporting)."""
+        return self._label_encoder.classes_
 
     # ------------------------------------------------------------------
     # FEATURES: numeric → binned → binary
@@ -856,23 +824,19 @@ class FeatureEngineer:
         self._vprint("FITTING FEATURE ENGINEER ON TRAINING DATA")
         self._vprint("=" * 80)
 
-        # Target: fit the three genre slot encoders
-        self._vprint("\n→ Fitting genre slot encoders...")
+        self._vprint("\n→ Fitting primary genre encoder...")
         self.fit_target(df['genres'])
 
-        # Numeric → bins
         self._vprint("\n→ Fitting numeric bins...")
         for col in [c for c in self.NUMERIC_TO_BIN if c in df.columns]:
             self._bin_numeric_column_fit(df[col], col)
         self._vprint(f"  ✓ {len(self.NUMERIC_TO_BIN)} numeric columns fitted")
 
-        # Low-cardinality categoricals → OHE
         self._vprint("\n→ Fitting categorical encoders...")
         for col in [c for c in self.LOW_CARDINALITY_COLS if c in df.columns]:
             self._ohe_fit(df[col], col)
         self._vprint(f"  ✓ {len(self.LOW_CARDINALITY_COLS)} categorical columns fitted")
 
-        # List-like → top-N frequency flags
         self._vprint("\n→ Fitting list-column top-N selectors...")
         for col in [c for c in self.LIST_LIKE_COLS if c in df.columns]:
             self._listcol_fit(df[col], col)
@@ -898,15 +862,11 @@ class FeatureEngineer:
 
         return pd.concat(parts, axis=1).fillna(0).astype(int)
 
-    def transform(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    def transform(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.Series]]:
         """
         Transforms a DataFrame into (X, y) where:
         - X: binary feature matrix ready for BernoulliNB
-        - y: DataFrame with columns genre_1, genre_2, genre_3 (integer-encoded)
-             or None if 'genres' column is absent
-
-        The feature schema is locked after fit_transform — test data is
-        reindexed to match exactly, with missing columns filled as 0.
+        - y: integer Series of primary genre labels, or None if 'genres' absent
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before transform().")
@@ -922,7 +882,7 @@ class FeatureEngineer:
 
         return X, y
 
-    def fit_transform(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def fit_transform(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         """
         Fits on df, transforms it, and locks in the training column schema.
         Always call this on training data — never on test data.
@@ -942,105 +902,71 @@ class FeatureEngineer:
 # =============================================================================
 
 def train_model(X_train: pd.DataFrame,
-                y_train: pd.DataFrame,
-                alpha: float = 1.0) -> MultiOutputClassifier:
+                y_train: pd.Series,
+                alpha: float = 1.0) -> BernoulliNB:
     """
-    Trains a Binary Relevance Naive Bayes model for the three genre slots.
-    One BernoulliNB classifier is trained independently per slot
-    (genre_1, genre_2, genre_3).
+    Trains a single BernoulliNB classifier to predict the primary genre.
 
     Args:
         X_train: Binary feature matrix
-        y_train: Integer target DataFrame with columns genre_1, genre_2, genre_3
-        alpha:   Laplace smoothing for BernoulliNB (default 1.0)
+        y_train: Integer-encoded primary genre labels (Series)
+        alpha:   Laplace smoothing (default 1.0)
 
     Returns:
-        Fitted MultiOutputClassifier wrapping BernoulliNB
+        Fitted BernoulliNB model
     """
-    model = MultiOutputClassifier(BernoulliNB(alpha=alpha))
+    model = BernoulliNB(alpha=alpha)
     model.fit(X_train, y_train)
     return model
 
 
-def evaluate_model(model: MultiOutputClassifier,
+def evaluate_model(model: BernoulliNB,
                    X_test: pd.DataFrame,
-                   y_test: pd.DataFrame,
+                   y_test: pd.Series,
                    engineer: 'FeatureEngineer') -> pd.DataFrame:
     """
-    Evaluates the three-slot genre model with per-slot accuracy and F1,
-    plus two combined metrics:
-      - Exact match: all three predicted slots match the true slots
-      - Partial match: at least one predicted genre appears in the true genre set
+    Evaluates the primary genre classifier.
+
+    Metrics reported:
+    - Overall accuracy
+    - Macro F1  (each genre weighted equally — penalises poor performance on rare genres)
+    - Weighted F1 (each genre weighted by support — reflects real-world performance)
+    - Per-genre precision, recall, F1, and support
 
     Args:
-        model:    Fitted MultiOutputClassifier
+        model:    Fitted BernoulliNB
         X_test:   Binary feature matrix
-        y_test:   True integer target DataFrame (genre_1, genre_2, genre_3)
-        engineer: Fitted FeatureEngineer (used to decode integer labels back to strings)
+        y_test:   True integer genre labels
+        engineer: Fitted FeatureEngineer (used to decode integers back to genre names)
 
     Returns:
-        DataFrame with per-slot classification report
+        DataFrame with per-genre metrics, sorted by F1 descending
     """
-    y_pred_array = np.array(model.predict(X_test))  # shape (n_samples, 3)
-    y_pred = pd.DataFrame(
-        y_pred_array,
-        columns=['genre_1', 'genre_2', 'genre_3'],
-        index=y_test.index
-    )
+    y_pred = model.predict(X_test)
+    classes = engineer.get_genre_classes()
 
-    genre_classes = engineer.get_genre_classes()
+    acc = accuracy_score(y_test, y_pred)
+    macro_f1    = f1_score(y_test, y_pred, average='macro',    zero_division=0)
+    weighted_f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
 
     print(f"\n{'='*60}")
-
-    slot_reports = {}
-    for slot in ['genre_1', 'genre_2', 'genre_3']:
-        le = engineer._label_encoders[slot]
-        classes = le.classes_
-
-        true_labels = le.inverse_transform(y_test[slot])
-        pred_labels = le.inverse_transform(y_pred[slot])
-
-        acc = accuracy_score(true_labels, pred_labels)
-        f1_macro = f1_score(true_labels, pred_labels, average='macro', zero_division=0)
-        f1_weighted = f1_score(true_labels, pred_labels, average='weighted', zero_division=0)
-
-        print(f"  {slot}: accuracy={acc:.4f}  macro_F1={f1_macro:.4f}  weighted_F1={f1_weighted:.4f}")
-
-        report = classification_report(
-            true_labels, pred_labels,
-            output_dict=True, zero_division=0
-        )
-        slot_reports[slot] = pd.DataFrame(report).T
-
-    # ------------------------------------------------------------------
-    # Combined metrics
-    # ------------------------------------------------------------------
-    # Decode all slots back to genre strings for comparison
-    true_decoded = pd.DataFrame({
-        slot: engineer._label_encoders[slot].inverse_transform(y_test[slot])
-        for slot in ['genre_1', 'genre_2', 'genre_3']
-    }, index=y_test.index)
-
-    pred_decoded = pd.DataFrame({
-        slot: engineer._label_encoders[slot].inverse_transform(y_pred[slot])
-        for slot in ['genre_1', 'genre_2', 'genre_3']
-    }, index=y_test.index)
-
-    # Exact match: the full triplet is identical
-    exact_match = (true_decoded.values == pred_decoded.values).all(axis=1).mean()
-
-    # Partial match: at least one predicted genre (excluding 'none') appears
-    # anywhere in the true genre set for that movie
-    none_label = engineer.NONE_LABEL
-    partial_matches = []
-    for i in range(len(true_decoded)):
-        true_set  = set(true_decoded.iloc[i]) - {none_label}
-        pred_set  = set(pred_decoded.iloc[i]) - {none_label}
-        partial_matches.append(len(true_set & pred_set) > 0)
-    partial_match = np.mean(partial_matches)
-
-    print(f"\n  Exact match  (all 3 slots correct): {exact_match:.4f}")
-    print(f"  Partial match (≥1 genre correct):   {partial_match:.4f}")
+    print(f"  Accuracy:     {acc:.4f}")
+    print(f"  Macro F1:     {macro_f1:.4f}  (equal weight per genre)")
+    print(f"  Weighted F1:  {weighted_f1:.4f}  (weighted by support)")
     print(f"{'='*60}\n")
 
-    return slot_reports
+    report = classification_report(
+        y_test, y_pred,
+        target_names=classes,
+        output_dict=True,
+        zero_division=0
+    )
+    per_genre = (
+        pd.DataFrame(report).T
+        .loc[classes, ['precision', 'recall', 'f1-score', 'support']]
+        .sort_values('f1-score', ascending=False)
+    )
+    print(per_genre.to_string())
+    return per_genre
+
+    
