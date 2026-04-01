@@ -2,3 +2,5 @@ rapidfuzz
 pandas
 scikit-learn
 numpy
+plotly
+seaborn
